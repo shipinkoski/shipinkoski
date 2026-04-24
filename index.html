@@ -1289,10 +1289,14 @@
   </div>
 
   <script>
+    const API_URL = "https://script.google.com/macros/s/AKfycbzgS0h52IL3Vz7eW6Y69wr8mIWF9a36FIMyiypL5GUcx85jEkA4qwyJSbYNC3MLZ646/exec";
+    const CLOUD_SYNC_ENABLED = true;
+
     const DB_NAME = "renovahq-dashboard-db";
     const DB_VERSION = 1;
     const STORE_NAME = "state";
     const STORE_KEY = "main";
+    const LEGACY_STORE_KEY = "renovahq-state-backup";
 
     const state = {
       properties: [],
@@ -1584,6 +1588,11 @@
 
     function dbGet() {
       return new Promise(resolve => {
+        if (!state.db) {
+          resolve(null);
+          return;
+        }
+
         const tx = state.db.transaction(STORE_NAME, "readonly");
         const req = tx.objectStore(STORE_NAME).get(STORE_KEY);
         req.onsuccess = () => resolve(req.result || null);
@@ -1591,23 +1600,121 @@
       });
     }
 
-    function dbSet() {
-      const payload = {
+    function snapshotPayload() {
+      return {
         properties: state.properties,
-        selectedPropertyId: state.selectedPropertyId,
-        receiptFolderHandle: state.receiptFolderHandle || null
+        selectedPropertyId: state.selectedPropertyId
       };
+    }
+
+    function saveLocalBackup() {
+      try {
+        localStorage.setItem(LEGACY_STORE_KEY, JSON.stringify(snapshotPayload()));
+      } catch {}
+    }
+
+    function loadLocalBackup() {
+      try {
+        const raw = localStorage.getItem(LEGACY_STORE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function dbSet() {
+      const payload = snapshotPayload();
 
       return new Promise(resolve => {
+        if (!state.db) {
+          resolve(false);
+          return;
+        }
+
         const tx = state.db.transaction(STORE_NAME, "readwrite");
         tx.objectStore(STORE_NAME).put(payload, STORE_KEY);
-        tx.oncomplete = resolve;
-        tx.onerror = resolve;
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
       });
     }
 
+    function dbSetReceiptHandle() {
+      return new Promise(resolve => {
+        if (!state.db) {
+          resolve(false);
+          return;
+        }
+
+        const tx = state.db.transaction(STORE_NAME, "readwrite");
+        tx.objectStore(STORE_NAME).put(state.receiptFolderHandle || null, "receipt-folder-handle");
+        tx.oncomplete = () => resolve(true);
+        tx.onerror = () => resolve(false);
+      });
+    }
+
+    function dbGetReceiptHandle() {
+      return new Promise(resolve => {
+        if (!state.db) {
+          resolve(null);
+          return;
+        }
+
+        const tx = state.db.transaction(STORE_NAME, "readonly");
+        const req = tx.objectStore(STORE_NAME).get("receipt-folder-handle");
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => resolve(null);
+      });
+    }
+
+    async function saveToCloud() {
+      if (!CLOUD_SYNC_ENABLED || !API_URL) return;
+
+      try {
+        await fetch(API_URL, {
+          method: "POST",
+          mode: "no-cors",
+          headers: {
+            "Content-Type": "text/plain;charset=utf-8"
+          },
+          body: JSON.stringify({
+            type: "full_state",
+            payload: snapshotPayload()
+          })
+        });
+      } catch (error) {
+        console.error("Cloud save failed", error);
+      }
+    }
+
+    async function loadFromCloud() {
+      if (!CLOUD_SYNC_ENABLED || !API_URL) return null;
+
+      try {
+        const response = await fetch(`${API_URL}?t=${Date.now()}`);
+        const data = await response.json();
+        const last = Array.isArray(data)
+          ? data.filter(item => item.type === "full_state").pop()
+          : null;
+
+        if (!last || !last.payload) return null;
+        return last.payload;
+      } catch (error) {
+        console.error("Cloud load failed", error);
+        return null;
+      }
+    }
+
     async function save() {
-      await dbSet();
+      const saved = await dbSet();
+      saveLocalBackup();
+      await saveToCloud();
+
+      if (!saved && !state.db) {
+        await render();
+        return;
+      }
+
+      await dbSetReceiptHandle();
       await render();
     }
 
@@ -2942,14 +3049,21 @@
     }
 
     async function init() {
-      state.db = await openDb();
-      const saved = await dbGet();
+      try {
+        state.db = await openDb();
+      } catch {
+        state.db = null;
+      }
+
+      const cloudSaved = await loadFromCloud();
+      const saved = cloudSaved || await dbGet() || loadLocalBackup();
 
       if (saved) {
         state.properties = saved.properties || [];
         state.selectedPropertyId = saved.selectedPropertyId || state.properties[0]?.id || null;
-        state.receiptFolderHandle = saved.receiptFolderHandle || null;
       }
+
+      state.receiptFolderHandle = await dbGetReceiptHandle();
 
       normalizeStateData();
 
